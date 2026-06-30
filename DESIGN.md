@@ -1,207 +1,208 @@
 # DESIGN — approval-service
 
-## 1. Service boundaries
+## 1. Границы сервиса
 
-The service owns exactly one bounded context: **the lifecycle of an approval
-request and its final decision.**
+Сервис владеет ровно одним bounded context: **жизненным циклом заявки на
+согласование и её итоговым решением.**
 
-It does **not** own, fetch, or persist anything about the content being approved.
-All external entities are stored as opaque identifiers:
+Он **не** владеет, не загружает и не хранит ничего о самом согласуемом контенте.
+Все внешние сущности хранятся как непрозрачные идентификаторы:
 
-- `sourceId` — the content under review (publication, scenario, edit, …)
-- `reviewerUserIds` — who may review
-- `workspace_id`, `created_by`, `decided_by` — tenancy / actors
+- `sourceId` — контент на ревью (публикация, сценарий, правка, …)
+- `reviewerUserIds` — кто может ревьюить
+- `workspace_id`, `created_by`, `decided_by` — арендатор (tenant) / акторы
 
-Consequences:
+Следствия:
 
-- The service never holds provider URLs, storage keys, signed URLs, tokens, or
-  raw provider payloads, so it cannot leak them. Free-text fields (`title`,
-  `description`, decision `comment`/`reason`) are the only place a client could
-  *accidentally* embed such data; everything written to **logs and events** is
-  therefore passed through a redactor (see §6).
-- Authorization (who may act) is delegated to an upstream identity service; here
-  it is a header-based stub (see README §4) with a clean dependency seam so the
-  real JWT validator drops in without touching business logic.
+- Сервис никогда не хранит provider URL, storage keys, signed URL, токены и сырые
+  provider payloads, поэтому не может их утечь. Свободные текстовые поля
+  (`title`, `description`, `comment`/`reason` в решении) — единственное место, куда
+  клиент мог бы *случайно* положить такие данные; поэтому всё, что попадает в
+  **логи и события**, пропускается через редактор (см. §7).
+- Авторизация (кто может действовать) делегирована вышестоящему сервису
+  идентификации; здесь это заглушка на заголовках (см. README §4) с чистым швом
+  для зависимости, чтобы настоящая проверка JWT подключалась без правки
+  бизнес-логики.
 
-## 2. Data model
+## 2. Модель данных
 
-Four tables. UUIDs are stored as `String(36)`, JSON via SQLAlchemy's portable
-`JSON` type, and timestamps as timezone-aware `DateTime` — all chosen so the
-identical schema works on both PostgreSQL and SQLite.
+Четыре таблицы. UUID хранятся как `String(36)`, JSON — через переносимый тип
+`JSON` SQLAlchemy, временные метки — как `DateTime` с таймзоной. Всё подобрано
+так, чтобы идентичная схема работала и на PostgreSQL, и на SQLite.
 
-### `approval_requests` — the aggregate root
+### `approval_requests` — корень агрегата
 
-| Column              | Type           | Notes                                              |
+| Колонка             | Тип            | Примечания                                         |
 |---------------------|----------------|----------------------------------------------------|
 | `id` (PK)           | String(36)     | UUID                                               |
-| `workspace_id`      | String(255)    | indexed; tenancy key                               |
+| `workspace_id`      | String(255)    | индекс; ключ арендатора                            |
 | `source_type`       | String(50)     | `publication` \| `scenario` \| `edit` \| `external`|
-| `source_id`         | String(255)    | opaque content id                                  |
+| `source_id`         | String(255)    | непрозрачный id контента                           |
 | `title`             | String(500)    |                                                    |
 | `description`       | Text (null)    |                                                    |
-| `reviewer_user_ids` | JSON           | list of user ids                                   |
+| `reviewer_user_ids` | JSON           | список id пользователей                            |
 | `status`            | String(50)     | `pending`/`approved`/`rejected`/`cancelled`        |
-| `decision_comment`  | Text (null)    | set on approve                                     |
-| `decision_reason`   | Text (null)    | set on reject/cancel                               |
-| `decided_by`        | String(255)    | actor of the final decision                        |
+| `decision_comment`  | Text (null)    | заполняется при approve                            |
+| `decision_reason`   | Text (null)    | заполняется при reject/cancel                      |
+| `decided_by`        | String(255)    | актор итогового решения                            |
 | `created_by`        | String(255)    |                                                    |
 | `created_at`        | DateTime(tz)   |                                                    |
 | `updated_at`        | DateTime(tz)   |                                                    |
 
-Indexes: `workspace_id`, `status`, and composite `(workspace_id, status)` for the
-common "list pending in my workspace" query.
+Индексы: `workspace_id`, `status` и составной `(workspace_id, status)` под частый
+запрос «список pending в моём workspace».
 
 ### `approval_events` — append-only audit trail
 
-One row per **successful** state change (who / what / when / before → after).
+Одна запись на каждое **успешное** изменение состояния (кто / что / когда / до → после).
 
-| Column            | Type         | Notes                                  |
+| Колонка           | Тип          | Примечания                             |
 |-------------------|--------------|----------------------------------------|
 | `id` (PK)         | String(36)   |                                        |
-| `workspace_id`    | String(255)  | indexed                                |
+| `workspace_id`    | String(255)  | индекс                                 |
 | `request_id` (FK) | String(36)   | → `approval_requests.id`, `ON DELETE CASCADE` |
 | `action`          | String(50)   | `created`/`approved`/`rejected`/`cancelled` |
 | `actor_user_id`   | String(255)  |                                        |
-| `previous_status` | String(50)   | null for `created`                     |
+| `previous_status` | String(50)   | null для `created`                     |
 | `new_status`      | String(50)   |                                        |
-| `event_metadata`  | JSON (null)  | sanitized context (e.g. comment/reason)|
+| `event_metadata`  | JSON (null)  | санитизированный контекст (напр. comment/reason) |
 | `created_at`      | DateTime(tz) |                                        |
 
-### `outbox_events` — transactional outbox
+### `outbox_events` — транзакционный outbox
 
-Domain events written in the **same transaction** as the state change.
+Доменные события, записываемые **в той же транзакции**, что и изменение состояния.
 
-| Column           | Type          | Notes                                  |
+| Колонка          | Тип           | Примечания                             |
 |------------------|---------------|----------------------------------------|
 | `id` (PK)        | String(36)    |                                        |
-| `workspace_id`   | String(255)   | indexed                                |
+| `workspace_id`   | String(255)   | индекс                                 |
 | `aggregate_type` | String(100)   | `approval_request`                     |
-| `aggregate_id`   | String(36)    | the request id                         |
-| `event_type`     | String(100)   | `approval_request.created` etc.        |
-| `payload`        | JSON          | already-sanitized event body           |
+| `aggregate_id`   | String(36)    | id заявки                              |
+| `event_type`     | String(100)   | `approval_request.created` и т.д.      |
+| `payload`        | JSON          | уже санитизированное тело события      |
 | `created_at`     | DateTime(tz)  |                                        |
-| `published_at`   | DateTime(tz)  | indexed; null = not yet published      |
+| `published_at`   | DateTime(tz)  | индекс; null = ещё не опубликовано      |
 
 ### `idempotency_keys`
 
-| Column            | Type        | Notes                                          |
+| Колонка           | Тип         | Примечания                                     |
 |-------------------|-------------|------------------------------------------------|
 | `id` (PK)         | String(36)  |                                                |
-| `workspace_id`    | String(255) | part of uniqueness                             |
-| `idempotency_key` | String(255) | client-supplied                                |
-| `request_hash`    | String(64)  | SHA-256 of the canonical request body          |
-| `response_status` | Integer     | stored response status                         |
-| `response_body`   | JSON        | stored response, replayed verbatim             |
-| `request_id`      | String(36)  | the created request                            |
+| `workspace_id`    | String(255) | часть уникальности                             |
+| `idempotency_key` | String(255) | предоставлен клиентом                          |
+| `request_hash`    | String(64)  | SHA-256 канонического тела запроса             |
+| `response_status` | Integer     | сохранённый статус ответа                      |
+| `response_body`   | JSON        | сохранённый ответ, воспроизводится дословно    |
+| `request_id`      | String(36)  | созданная заявка                               |
 | `created_at`      | DateTime(tz)|                                                |
 | **Unique**        |             | `(workspace_id, idempotency_key)`              |
 
-## 3. Workspace isolation
+## 3. Изоляция workspace
 
-Defence in depth, two independent layers:
+Защита в глубину, два независимых уровня:
 
-1. **Request layer** — the auth dependency requires `X-Workspace-Id` to equal the
-   `{workspace_id}` path segment; a mismatch is `403` before any data is touched.
-2. **Data layer** — *every* query is filtered by `workspace_id`. A request id
-   from another workspace simply isn't found (`404`), never disclosed.
+1. **Уровень запроса** — auth-зависимость требует, чтобы `X-Workspace-Id` совпадал
+   с сегментом пути `{workspace_id}`; несовпадение → `403` ещё до обращения к данным.
+2. **Уровень данных** — *каждый* запрос фильтруется по `workspace_id`. Id заявки из
+   чужого workspace просто не находится (`404`) и никогда не раскрывается.
 
-Idempotency keys are likewise unique **per workspace**, so the same key string in
-two workspaces yields two independent requests.
+Ключи идемпотентности также уникальны **в пределах workspace**, поэтому одна и та же
+строка ключа в двух workspace даёт две независимые заявки.
 
-## 4. State machine & finality
+## 4. Машина состояний и финальность
 
 ```
-                approve  ─▶ approved   (final)
-pending ────────reject   ─▶ rejected   (final)
-                cancel   ─▶ cancelled  (final)
+                approve  ─▶ approved   (финальный)
+pending ────────reject   ─▶ rejected   (финальный)
+                cancel   ─▶ cancelled  (финальный)
 ```
 
-`pending` is the only non-final state. Any decision attempted on a request that
-is already in a final state returns **409 Conflict** and writes nothing — this
-single rule simultaneously guarantees "no second final decision" and "no invalid
-transition". Verified by tests for every approve/reject/cancel combination.
+`pending` — единственное нефинальное состояние. Любое решение, применённое к
+заявке, которая уже в финальном состоянии, возвращает **409 Conflict** и ничего не
+пишет — это одно правило одновременно гарантирует «нет второго финального решения»
+и «нет невалидных переходов». Проверено тестами для всех комбинаций
+approve/reject/cancel.
 
-## 5. Idempotency
+## 5. Идемпотентность
 
-**Mechanism chosen: `Idempotency-Key` request header** (industry-standard, used
-by Stripe/others), applied to the only naturally non-idempotent operation —
-**create**.
+**Выбранный механизм: заголовок `Idempotency-Key`** (индустриальный стандарт,
+используется Stripe и др.), применяемый к единственной по природе неидемпотентной
+операции — **созданию**.
 
-- The client sends `Idempotency-Key: <opaque>`.
-- The service stores `(workspace_id, key)` with a SHA-256 hash of the canonical
-  request body and the serialized 201 response.
-- A **replay with the same key + same body** returns the original response
-  verbatim (with `Idempotency-Replayed: true`) — no duplicate row.
-- A **replay with the same key + different body** is a client error → `409`.
-- The request, its audit row, its outbox event and the idempotency record all
-  commit in **one transaction**. A unique constraint on `(workspace_id, key)`
-  closes the concurrent-duplicate race: the loser catches the `IntegrityError`,
-  rolls back, and returns the winner's stored response.
+- Клиент присылает `Idempotency-Key: <opaque>`.
+- Сервис сохраняет `(workspace_id, key)` вместе с SHA-256 канонического тела
+  запроса и сериализованным ответом 201.
+- **Повтор с тем же ключом и тем же телом** возвращает исходный ответ дословно
+  (с заголовком `Idempotency-Replayed: true`) — без дубля.
+- **Повтор с тем же ключом, но другим телом** — клиентская ошибка → `409`.
+- Заявка, её audit-запись, событие outbox и запись идемпотентности коммитятся в
+  **одной транзакции**. Уникальное ограничение на `(workspace_id, key)` закрывает
+  гонку конкурентных дублей: проигравший ловит `IntegrityError`, откатывается и
+  возвращает сохранённый ответ победителя.
 
-The decision endpoints don't need keys: state finality already makes a repeated
-approve/reject/cancel a safe `409` rather than a duplicate.
+Эндпоинтам решений ключи не нужны: финальность состояния уже превращает повторный
+approve/reject/cancel в безопасный `409`, а не в дубль.
 
-## 6. Events & integrations (event-ready)
+## 6. События и интеграции (event-ready)
 
-**Transactional outbox + in-process event bus.**
+**Транзакционный outbox + in-process event bus.**
 
-- On every state change the service inserts an `outbox_events` row inside the
-  business transaction. If the transaction rolls back, no event is produced —
-  state and events can never diverge.
-- After commit, a dispatcher publishes unpublished rows to an `EventBus` and
-  stamps `published_at`. Publishing is at-least-once: a failure leaves rows
-  unpublished for a later sweep (in production the dispatcher runs on a
-  background worker/poller; here it runs inline after each request).
-- Business logic only ever calls `event_bus.publish(event)`. Swapping the
-  default `InProcessEventBus` (which currently just logs) for a Kafka or RabbitMQ
-  producer is a one-class change with **zero edits to the service layer or the
-  outbox** — that is the extensibility seam the spec asks for.
+- При каждом изменении состояния сервис вставляет строку в `outbox_events` внутри
+  бизнес-транзакции. Если транзакция откатилась — событие не порождается, состояние
+  и события никогда не расходятся.
+- После коммита диспетчер публикует неопубликованные строки в `EventBus` и
+  проставляет `published_at`. Публикация at-least-once: при сбое строки остаются
+  неопубликованными для последующего прохода (в production диспетчер запускается на
+  фоновом воркере/поллере; здесь — inline после каждого запроса).
+- Бизнес-логика всегда вызывает только `event_bus.publish(event)`. Замена
+  дефолтного `InProcessEventBus` (который сейчас просто логирует) на продюсера
+  Kafka или RabbitMQ — это изменение одного класса с **нулевыми правками сервисного
+  слоя и outbox**, что и есть запрошенный в ТЗ шов расширяемости.
 
-Event types emitted: `approval_request.{created,approved,rejected,cancelled}`.
+Типы событий: `approval_request.{created,approved,rejected,cancelled}`.
 
-## 7. Data safety (no secret/PII leakage)
+## 7. Безопасность данных (без утечек секретов/PII)
 
-`app/core/sanitization.py` recursively redacts before anything reaches **logs**
-or **events**:
+`app/core/sanitization.py` рекурсивно маскирует данные до того, как что-либо
+попадёт в **логи** или **события**:
 
-- emails → `[REDACTED_EMAIL]`
-- `http(s)` URLs, incl. signed/provider URLs → `[REDACTED_URL]`
-- JWTs and `Bearer …` tokens → `[REDACTED_TOKEN]`
-- values under sensitive keys (`token`, `password`, `secret`, `authorization`,
+- email → `[REDACTED_EMAIL]`
+- `http(s)` URL, включая signed/provider URL → `[REDACTED_URL]`
+- JWT и `Bearer …` токены → `[REDACTED_TOKEN]`
+- значения по секретным ключам (`token`, `password`, `secret`, `authorization`,
   `signed_url`, `storage_key`, `provider_url`, `provider_payload`, …) → `[REDACTED]`
 
-Because the service stores only opaque ids and never enriches with provider
-data, API responses cannot contain infrastructure secrets by construction.
-The free-text fields a client itself submits (`title`, `description`,
-`comment`, `reason`) are echoed back verbatim in responses (they *are* the
-content under review), but are redacted everywhere they fan out to logs and
-events.
+Поскольку сервис хранит только непрозрачные id и никогда не обогащает данные
+provider-информацией, ответы API не могут содержать инфраструктурные секреты по
+построению. Свободные текстовые поля, которые присылает сам клиент (`title`,
+`description`, `comment`, `reason`), возвращаются в ответах дословно (это и есть
+контент на ревью), но маскируются везде, куда они расходятся — в логи и события.
 
-## 8. Logging & observability
+## 8. Логирование и наблюдаемость
 
-Structured JSON logs (`app/core/logging.py`). A middleware assigns a
-`request_id` (honouring an inbound `X-Request-Id`), propagates it plus
-`workspace_id`/`user_id` via `contextvars`, returns it as the `X-Request-Id`
-response header, and logs one `request.handled` line per request with method,
-path, status and duration. State changes log a `approval.state_change` line.
+Структурированные логи JSON (`app/core/logging.py`). Middleware присваивает
+`request_id` (с учётом входящего `X-Request-Id`), пробрасывает его, а также
+`workspace_id`/`user_id` через `contextvars`, возвращает его в заголовке ответа
+`X-Request-Id` и пишет одну строку `request.handled` на запрос с методом, путём,
+статусом и длительностью. Изменения состояния логируют строку
+`approval.state_change`.
 
-## 9. Known trade-offs & compromises
+## 9. Известные компромиссы
 
-- **Synchronous SQLAlchemy.** Chosen for operational simplicity and rock-solid
-  Alembic/driver behaviour; FastAPI runs the sync handlers in a threadpool. For
-  very high concurrency an async stack (asyncpg) would be the next step.
-- **Inline outbox dispatch.** Events are dispatched right after commit in the
-  request path rather than by a separate worker. This keeps the deployment a
-  single process; the dispatcher (`dispatch_pending`) is already written to be
-  lifted into a background poller unchanged.
-- **Header-based auth stub.** Intentional per the spec — trivially swapped for
-  real JWT verification at the `get_principal` dependency.
-- **Status/source enums stored as strings**, validated in the application layer
-  rather than as native DB enums, to keep one migration that is byte-for-byte
-  reproducible across PostgreSQL and SQLite.
-- **No soft-delete / history of edits to `title`/`description`.** Requests are
-  immutable after creation except for the single decision transition; the audit
-  trail captures every status change. Editing content was out of scope.
-- **Idempotency stored indefinitely.** A TTL/cleanup job for old idempotency
-  keys would be added for production retention hygiene.
-```
+- **Синхронный SQLAlchemy.** Выбран ради операционной простоты и предсказуемого
+  поведения Alembic/драйверов; FastAPI выполняет синхронные хендлеры в threadpool.
+  Для очень высокой конкурентности следующим шагом был бы async-стек (asyncpg).
+- **Inline-диспетчеризация outbox.** События публикуются сразу после коммита в
+  пути запроса, а не отдельным воркером. Это сохраняет деплой одним процессом;
+  диспетчер (`dispatch_pending`) уже написан так, чтобы без изменений вынестись в
+  фоновый поллер.
+- **Auth-заглушка на заголовках.** Намеренно по ТЗ — тривиально заменяется на
+  настоящую проверку JWT в зависимости `get_principal`.
+- **Enum'ы статуса/типа хранятся строками**, валидация на уровне приложения, а не
+  нативными DB-enum, чтобы одна миграция была байт-в-байт воспроизводима на
+  PostgreSQL и SQLite.
+- **Нет soft-delete / истории правок `title`/`description`.** Заявки неизменяемы
+  после создания, кроме единственного перехода-решения; audit trail фиксирует
+  каждое изменение статуса. Редактирование контента вне области задачи.
+- **Ключи идемпотентности хранятся бессрочно.** Для production добавился бы
+  TTL/задача очистки старых ключей идемпотентности для гигиены хранения.

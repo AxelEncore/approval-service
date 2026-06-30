@@ -1,45 +1,45 @@
 # approval-service
 
-A production-ready backend service for **content approval workflows**. Clients
-submit content (a publication, scenario, edit, or external item) for review and
-the service records the final decision (`approved` / `rejected` / `cancelled`),
-with a full audit trail and an event stream for downstream integrations.
+Production-ready backend-сервис для **процессов согласования контента**. Клиенты
+отправляют контент (публикацию, сценарий, правку или внешний объект) на ревью, а
+сервис фиксирует итоговое решение (`approved` / `rejected` / `cancelled`) с полным
+audit trail и потоком событий для смежных интеграций.
 
-External entities (`sourceId`, `reviewerUserIds`, `workspace_id`, users) are
-opaque identifiers — neighbouring services are out of scope.
+Внешние сущности (`sourceId`, `reviewerUserIds`, `workspace_id`, пользователи) —
+это непрозрачные идентификаторы; соседние сервисы вне области реализации.
 
-- **Stack:** Python · FastAPI · SQLAlchemy · Alembic · PostgreSQL (SQLite for local)
-- **Runs with one command:** `docker-compose up`
-- **Tested:** 46 pytest cases covering the full spec
+- **Стек:** Python · FastAPI · SQLAlchemy · Alembic · PostgreSQL (SQLite для локального запуска)
+- **Запуск одной командой:** `docker-compose up`
+- **Покрытие тестами:** 46 кейсов pytest по всему ТЗ
 
-See [DESIGN.md](DESIGN.md) for the data model, idempotency mechanism, event
-architecture, and trade-offs.
+Модель данных, механизм идемпотентности, архитектура событий и компромиссы
+описаны в [DESIGN.md](DESIGN.md).
 
 ---
 
-## 1. Quick start (Docker)
+## 1. Быстрый старт (Docker)
 
 ```bash
 docker-compose up --build
 ```
 
-This starts PostgreSQL, waits for it to be healthy, **applies migrations
-automatically** (`alembic upgrade head`), and serves the API on
+Поднимается PostgreSQL, дожидается healthcheck, **автоматически применяются
+миграции** (`alembic upgrade head`), и API становится доступен на
 **http://localhost:8000**.
 
-- OpenAPI docs: http://localhost:8000/docs
+- OpenAPI-документация: http://localhost:8000/docs
 - Liveness: http://localhost:8000/health
-- Readiness (checks DB): http://localhost:8000/ready
+- Readiness (проверяет БД): http://localhost:8000/ready
 
-Stop and wipe the database volume:
+Остановить и удалить том с данными БД:
 
 ```bash
 docker-compose down -v
 ```
 
-## 2. Run locally without Docker (SQLite)
+## 2. Локальный запуск без Docker (SQLite)
 
-No external dependencies — the default `DATABASE_URL` is a local SQLite file.
+Без внешних зависимостей — по умолчанию `DATABASE_URL` указывает на локальный файл SQLite.
 
 ```bash
 python -m venv .venv
@@ -50,7 +50,7 @@ alembic upgrade head
 uvicorn app.main:app --reload
 ```
 
-To run locally against PostgreSQL instead, set the DSN:
+Чтобы локально работать с PostgreSQL, задайте DSN:
 
 ```bash
 export DATABASE_URL=postgresql+psycopg2://approval:approval@localhost:5432/approval
@@ -58,56 +58,57 @@ alembic upgrade head
 uvicorn app.main:app
 ```
 
-## 3. Run the tests
+## 3. Запуск тестов
 
-The test-suite runs entirely on SQLite (no Docker/Postgres needed):
+Тесты полностью работают на SQLite (Docker/Postgres не нужны):
 
 ```bash
 pip install -r requirements-dev.txt
 pytest
 ```
 
-Coverage includes: create / read / list, approve / reject / cancel, workspace
-isolation, idempotency, double-final-decision (409), invalid state transitions,
-missing permissions (401/403), missing resources (404), audit trail, outbox
-events, secret/PII redaction, and reproducible Alembic migrations.
+Покрытие включает: создание / чтение / список, approve / reject / cancel,
+workspace isolation, идемпотентность, повторное финальное решение (409),
+невалидные переходы состояний, отсутствие прав (401/403), несуществующие ресурсы
+(404), audit trail, события outbox, маскирование секретов/PII и воспроизводимость
+миграций Alembic.
 
 ---
 
-## 4. Authentication (local stub)
+## 4. Аутентификация (локальная заглушка)
 
-A real deployment would validate a signed JWT from the platform identity
-service. For local/dev this service trusts three request headers:
+В реальном развёртывании здесь была бы проверка подписанного JWT от платформенного
+сервиса идентификации. Для локального запуска сервис доверяет трём заголовкам:
 
-| Header            | Example                                   | Meaning                          |
+| Заголовок         | Пример                                    | Назначение                       |
 |-------------------|-------------------------------------------|----------------------------------|
-| `X-User-Id`       | `usr_admin`                               | Acting user                      |
-| `X-Workspace-Id`  | `ws_1`                                     | Caller's workspace               |
-| `X-Permissions`   | `approval:read,approval:create`           | Comma-separated permission list  |
+| `X-User-Id`       | `usr_admin`                               | Действующий пользователь         |
+| `X-Workspace-Id`  | `ws_1`                                     | Workspace вызывающего            |
+| `X-Permissions`   | `approval:read,approval:create`           | Список прав через запятую         |
 
-Rules:
+Правила:
 
-- Missing `X-User-Id` or `X-Workspace-Id` → **401**.
-- `X-Workspace-Id` **must equal** the `{workspace_id}` in the URL path, otherwise
-  **403** (first line of workspace isolation).
-- The endpoint's required permission must be present in `X-Permissions`, else **403**.
+- Отсутствие `X-User-Id` или `X-Workspace-Id` → **401**.
+- `X-Workspace-Id` **должен совпадать** с `{workspace_id}` в URL, иначе **403**
+  (первый рубеж изоляции workspace).
+- Требуемое для эндпоинта право должно присутствовать в `X-Permissions`, иначе **403**.
 
-### Permission matrix
+### Матрица прав
 
-| Action               | Endpoint                                  | Required permission |
+| Действие             | Эндпоинт                                  | Требуемое право     |
 |----------------------|-------------------------------------------|---------------------|
-| Read / list          | `GET .../approval-requests[/{id}]`        | `approval:read`     |
-| Create               | `POST .../approval-requests`              | `approval:create`   |
+| Чтение / список      | `GET .../approval-requests[/{id}]`        | `approval:read`     |
+| Создание             | `POST .../approval-requests`              | `approval:create`   |
 | Approve / Reject     | `POST .../{id}/approve` `/reject`         | `approval:decide`   |
 | Cancel               | `POST .../{id}/cancel`                    | `approval:cancel`   |
 
 ---
 
-## 5. API & curl examples
+## 5. API и примеры curl
 
-Base path: `/api/v1/workspaces/{workspace_id}/approval-requests`
+Базовый путь: `/api/v1/workspaces/{workspace_id}/approval-requests`
 
-A convenience variable for the examples:
+Удобные переменные для примеров:
 
 ```bash
 AUTH=(-H "X-User-Id: usr_admin" -H "X-Workspace-Id: ws_1" \
@@ -122,10 +123,10 @@ curl http://localhost:8000/health
 curl http://localhost:8000/ready
 ```
 
-### Create a request
+### Создание заявки
 
-`Idempotency-Key` is optional; sending the same key + body again replays the
-original response instead of creating a duplicate.
+`Idempotency-Key` опционален; повторная отправка того же ключа и тела вернёт
+исходный ответ, не создавая дубль.
 
 ```bash
 curl -X POST "$BASE" "${AUTH[@]}" \
@@ -161,7 +162,7 @@ curl -X POST "$BASE" "${AUTH[@]}" \
 }
 ```
 
-### List requests (with optional filter & pagination)
+### Список заявок (с фильтром и пагинацией)
 
 ```bash
 curl "$BASE" "${AUTH[@]}"
@@ -170,7 +171,7 @@ curl "$BASE?status=pending&limit=20&offset=0" "${AUTH[@]}"
 
 → `{ "items": [...], "total": 1, "limit": 50, "offset": 0 }`
 
-### Get one request
+### Получение одной заявки
 
 ```bash
 curl "$BASE/<request_id>" "${AUTH[@]}"
@@ -200,33 +201,33 @@ curl -X POST "$BASE/<request_id>/cancel" "${AUTH[@]}" \
   -d '{ "reason": "Draft was removed" }'
 ```
 
-A request that is already `approved`/`rejected`/`cancelled` cannot change again —
-any further decision returns **409 Conflict**.
+Заявка, которая уже находится в статусе `approved`/`rejected`/`cancelled`, не может
+измениться повторно — любое следующее решение вернёт **409 Conflict**.
 
 ---
 
-## 6. Observability
+## 6. Наблюдаемость (observability)
 
-Every request and every state change is logged as a single JSON line including
-`request_id`, `workspace_id`, `user_id`, the action and the result. Secrets and
-PII (emails, URLs, signed/provider URLs, bearer tokens, JWTs, and obviously-named
-secret fields) are redacted from logs and domain events. The response header
-`X-Request-Id` correlates client requests with log lines.
+Каждый запрос и каждое изменение состояния логируется одной строкой JSON с
+`request_id`, `workspace_id`, `user_id`, действием и результатом. Секреты и PII
+(email, URL, в том числе signed/provider URL, bearer-токены, JWT и поля с
+очевидно секретными именами) маскируются в логах и доменных событиях. Заголовок
+ответа `X-Request-Id` связывает клиентские запросы с логами.
 
-## 7. Project layout
+## 7. Структура проекта
 
 ```
 approval-service/
 ├── app/
-│   ├── api/          # FastAPI routers (health, approval-requests)
-│   ├── core/         # config, db, auth stub, logging, sanitization, enums
-│   ├── events/       # in-process event bus + outbox dispatcher
-│   ├── models/       # SQLAlchemy models
-│   ├── schemas/      # Pydantic schemas
-│   ├── services/     # business logic (approval state machine, idempotency)
-│   └── main.py       # app factory + middleware
+│   ├── api/          # роутеры FastAPI (health, approval-requests)
+│   ├── core/         # конфиг, БД, auth-заглушка, логирование, санитизация, enum'ы
+│   ├── events/       # in-process event bus + диспетчер outbox
+│   ├── models/       # SQLAlchemy-модели
+│   ├── schemas/      # Pydantic-схемы
+│   ├── services/     # бизнес-логика (state machine согласования, идемпотентность)
+│   └── main.py       # фабрика приложения + middleware
 ├── migrations/       # Alembic env + versions
-├── tests/            # pytest suite (SQLite)
+├── tests/            # набор pytest (SQLite)
 ├── Dockerfile
 ├── docker-compose.yml
 ├── entrypoint.sh     # alembic upgrade head && uvicorn
